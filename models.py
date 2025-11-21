@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 class ActorCritic(nn.Module):
     def __init__(self, l_obs, n_act, hidden_size=32):
@@ -30,16 +31,13 @@ class ActorCritic(nn.Module):
 
         return pi, vi
     
-
 class ConvActorCritic(nn.Module):
-    def __init__(self, l1, l2, l_obs, n_action):
+    def __init__(self, input_channels, n_actions):
         super(ConvActorCritic, self).__init__()
-        self.l1 = l1
-        self.l2 = l2
-        self.l_obs = l_obs
-        self.n_action = n_action
+        
+        # input_channels 应该是 4 (Stack frames)
         self.conv = nn.Sequential(
-            nn.Conv2d(l_obs, 32, 5, stride=1, padding=2),
+            nn.Conv2d(input_channels, 32, 5, stride=1, padding=2),
             nn.MaxPool2d(2, 2),
             nn.ReLU(),
             nn.Conv2d(32, 32, 5, stride=1, padding=1),
@@ -52,16 +50,28 @@ class ConvActorCritic(nn.Module):
             nn.MaxPool2d(2, 2),
             nn.ReLU(),
         )
-        self.fc = nn.Sequential(nn.Linear(1024, 512),
-                                nn.ReLU())
-        self.act_net = nn.Linear(512, self.n_action)
+        
+        # 自动计算 FC 层输入大小 (适应 84x84 输入)
+        dummy_input = torch.zeros(1, input_channels, 84, 84)
+        with torch.no_grad():
+            conv_out = self.conv(dummy_input)
+            self.fc_input_dim = int(np.prod(conv_out.size()))
+
+        self.fc = nn.Sequential(
+            nn.Linear(self.fc_input_dim, 512),
+            nn.ReLU()
+        )
+        
+        self.act_net = nn.Linear(512, n_actions)
         self.cri_net = nn.Linear(512, 1)
+        
+        self.apply(self._weight_init)
 
     def forward(self, inputs):
+        # inputs 必须是 [Batch, Channel, H, W]
         x = self.conv(inputs)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
-
         return self.act_net(x), self.cri_net(x)
 
 def weight_init(m):
