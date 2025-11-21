@@ -1,5 +1,5 @@
 # 复现Meta-Gradient reinforcement learning
 
-这个代码的相关的库需要提前安装https://github.com/facebookresearch/torchbeast 这个库中的文件
+通过我们的代码只需将代码运行过程需要安装的库安装完毕之后就可以直接进行训练
 
-在我们的复现的过程中我们仓库中的torchbeast仅仅为设置的baseline的运行的代码
+仓库中包含单Actor的Actor-Critic算法,以及多Actor的Actor-Critic算法,
