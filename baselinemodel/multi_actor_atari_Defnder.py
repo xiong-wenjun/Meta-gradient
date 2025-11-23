@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import time
 import random
 import queue
@@ -36,7 +37,7 @@ ENV_ID = "ALE/Defender-v5"
 NUM_ACTORS = 80                 # Defender 需要大量样本来学习躲避和射击
 UNROLL_LENGTH = 20              
 BATCH_UNROLLS = 32              
-MAX_FRAMES = 20_000_000         # 建议保持 20M 或更多
+MAX_FRAMES = 200_000_000         # 建议保持 20M 或更多
 GAMMA = 0.99
 
 # ====== 修改 3: 学习率 ======
@@ -224,7 +225,7 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
         agent.load_state_dict(weights)
     except queue.Empty:
         return
-
+    current_episode_score = 0.0
     while True:
         try:
             while True:
@@ -239,7 +240,7 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
         rewards = []
         dones = []
         behavior_logps = []
-
+        completed_episode_scores = []
         for t in range(unroll_length):
             obs_list.append(np.array(obs, dtype=np.uint8))
 
@@ -249,6 +250,7 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
 
             obs_next, r, terminated, truncated, _ = env.step(a)
             done = terminated or truncated
+            current_episode_score += r
             r = float(np.clip(r, -1, 1))
 
             rewards.append(r)
@@ -256,6 +258,8 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
 
             obs = obs_next
             if done:
+                completed_episode_scores.append(current_episode_score)
+                current_episode_score = 0.0
                 obs, _ = env.reset()
 
         obs_list.append(np.array(obs, dtype=np.uint8))
@@ -266,8 +270,13 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
             "rewards": np.array(rewards, dtype=np.float32),
             "dones": np.array(dones, dtype=np.float32),
             "logp_b": np.array(behavior_logps, dtype=np.float32),
+            "real_scores": np.array(completed_episode_scores, dtype=np.float32),
         }
-        data_queue.put(batch)
+        try:
+            data_queue.put(batch)
+        except (BrokenPipeError, EOFError, OSError):
+            # 如果管道断了（说明主进程结束了），Actor 也应该安静地结束
+            return
 
 # ---------------------------
 #  Learner 训练步
@@ -397,7 +406,6 @@ def run(seed=42):
     start_time = time.time()
 
     os.makedirs("checkpoints", exist_ok=True)
-
     npy_path = f"checkpoints/impala_{ENV_ID.replace('/', '_')}_records.npy"
     model_path = f"checkpoints/impala_{ENV_ID.replace('/', '_')}.pth"
 
@@ -410,7 +418,11 @@ def run(seed=42):
                 batch = data_queue.get()
                 batch_list.append(batch)
                 total_frames += UNROLL_LENGTH * FRAME_SKIP
-
+                if "real_scores" in batch and len(batch["real_scores"]) > 0:
+                    for score in batch["real_scores"]:
+                        records.append((total_frames, score))
+                        print(f"=== Frame {total_frames} | Episode Score: {score:.2f} ===")
+                
             loss, pl, vl, ent = learner_train_step(agent, optimizer, batch_list)
             update_count += 1
 
@@ -427,6 +439,8 @@ def run(seed=42):
             if update_count % 100 == 0:
                 elapsed = time.time() - start_time
                 fps = total_frames / elapsed
+                np.save(npy_path, np.array(records))
+                print(f"Online scores saved. Total games played: {len(records)}")
                 print(
                     f"[Update {update_count:5d}] Frames: {total_frames/1e6:.2f}M | "
                     f"Loss: {loss:.3f} (P {pl:.3f}, V {vl:.3f}, H {ent:.3f}) | FPS: {fps:.0f}"
@@ -434,14 +448,10 @@ def run(seed=42):
 
             if update_count % 500 == 0:
                 avg_score = evaluate(ENV_ID, agent, episodes=3)
-                records.append((total_frames, avg_score))
                 print(
                     f"=== Eval @ {total_frames/1e6:.2f}M frames | "
                     f"Avg Score: {avg_score:.2f} | Time: {time.time() - start_time:.1f}s ==="
                 )
-                np.save(npy_path, np.array(records))
-                print(f"Running data saved to {npy_path}")
-
 
     except KeyboardInterrupt:
         print("Training interrupted.")
