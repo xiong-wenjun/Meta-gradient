@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # 1. 讀取數據 (請確保路徑正確)
-path = "/gemini/code/project/baselinemodel/checkpoints/impala_ALE_Defender-v5_records.npy"
+path = "/gemini/code/project/baselinemodel/checkpoints/impala_lstm_ALE_Defender-v5_records.npy"
 try:
     data = np.load(path)
 except FileNotFoundError:
@@ -25,10 +25,10 @@ plt.figure(figsize=(12, 6), dpi=100) # dpi=100 讓顯示更清晰
 #plt.plot(df['frames'], df['scores'], color='lightblue', alpha=0.3, label='Raw Data (Real-time)')
 
 # 畫平滑數據 (深色，作為主趨勢線)
-plt.plot(df['frames'], df['smooth'], color='blue', linewidth=2, label='Smoothed (Moving Avg)')
+plt.plot(df['frames'], df['smooth'], color='red', linewidth=2, label='Smoothed (Moving Avg)')
 
 # 設置標題和標籤
-plt.title("IMPALA (ResNet) Training Curve - Defender", fontsize=14)
+plt.title("IMPALA (ResNet + LSTM) Training Curve - Defender", fontsize=14)
 plt.xlabel("Frames", fontsize=12)
 plt.ylabel("Score", fontsize=12)
 plt.grid(True, alpha=0.3)
@@ -36,7 +36,7 @@ plt.legend(loc='upper left')
 
 # === 核心修改：保存圖片 ===
 # dpi=300 表示保存為高分辨率圖片，適合放進論文或報告
-save_filename = "/gemini/code/defender_training_curve.png"
+save_filename = "/gemini/code/training_curve.png"
 plt.savefig(save_filename, dpi=300, bbox_inches='tight')
 print(f"圖片已保存為: {save_filename}")
 
