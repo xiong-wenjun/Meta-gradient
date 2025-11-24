@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 想用哪块 GPU 在这里改
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 想用哪块 GPU 在这里改
 
 import time
 import random
@@ -39,8 +39,8 @@ UNROLL_LENGTH = 80
 BATCH_UNROLLS = 16
 MAX_FRAMES = 200_000_000
 
-GAMMA = 0.99
-LR = 2e-4
+GAMMA = 0.997
+LR = 6e-4
 ENTROPY_COEF = 0.01
 VALUE_COEF = 0.5
 CLIP_GRAD_NORM = 40.0
@@ -278,9 +278,9 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
             done = terminated or truncated
 
             episode_return += r
-            #r_clip = float(np.clip(r, -1, 1))
-            r_scaled = np.sign(r) * np.log(1.0 + np.abs(r))
-            r_clip = float(r_scaled)
+            r_clip = float(np.clip(r, -1, 1))
+            #r_scaled = np.sign(r) * np.log(1.0 + np.abs(r))
+            #r_clip = float(r_scaled)
             
             actions.append(a)
             behavior_logps.append(logp)
@@ -445,8 +445,8 @@ def run(seed=42):
 
     records = []
     os.makedirs("checkpoints", exist_ok=True)
-    npy_path = f"checkpoints/impala_lstm_{ENV_ID.replace('/', '_')}_records.npy"
-    model_path = f"checkpoints/impala_lstm_{ENV_ID.replace('/', '_')}.pth"
+    npy_path = f"checkpoints/bs32_lstm_{ENV_ID.replace('/', '_')}_records.npy"
+    model_path = f"checkpoints/bs32_lstm_{ENV_ID.replace('/', '_')}.pth"
 
     try:
         while total_frames < MAX_FRAMES:

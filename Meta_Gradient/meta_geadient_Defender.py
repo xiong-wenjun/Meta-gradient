@@ -16,7 +16,7 @@ from torch.distributions import Categorical
 import torch.func as tf
 
 # =====================================================
-#  改进点 1: 调整超参数
+#  Global Config
 # =====================================================
 
 gym.register_envs(ale_py)
@@ -37,58 +37,43 @@ ENV_ID = "ALE/Defender-v5"
 NUM_ACTORS = 80
 UNROLL_LENGTH = 80
 BATCH_UNROLLS = 32
-
 MAX_FRAMES = 200_000_000
 
-# === 关键改进：降低学习率，提高稳定性 ===
-LR = 2e-4           # 从 5e-4 降到 2e-4
-META_LR = 5e-5      # 从 1e-4 降到 5e-5，更保守
-WARMUP_UPDATES = 500  # 前500步只训练主网络，不更新Gamma
+LR = 2e-4
+META_LR = 1e-3
+WARMUP_UPDATES = 50
 
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.01  # === 恢复使用固定熵系数 ===
 VALUE_COEF = 0.5
-CLIP_GRAD_NORM = 10.0  # 从40降到10，更严格的梯度裁剪
+CLIP_GRAD_NORM = 40.0
 FRAME_SKIP = 4
 
-# === 改进点 2: Reward Scaling 替代 Clipping ===
-REWARD_SCALE = 0.01  # 把分数缩小100倍，而不是clip
-
 # =====================================================
-#  改进点 3: 放宽 Gamma 范围，增加 Entropy Bonus
+#  Meta Parameters (只包含 Gamma)
 # =====================================================
 
 class MetaParams(nn.Module):
     def __init__(self, init_gamma=0.99):
         super().__init__()
-        # 扩大范围到 [0.90, 0.999]，给Meta-Learner更多自由度
+        # Gamma 范围 [0.90, 0.999]
         self.min_gamma = 0.90
         self.max_gamma = 0.999
         self.scale = self.max_gamma - self.min_gamma
         
+        # 初始化 Logit
         init_val = (init_gamma - self.min_gamma) / self.scale
         init_logit = np.log(init_val / (1.0 - init_val))
         
         self.gamma_logit = nn.Parameter(torch.tensor(float(init_logit)))
         
-        # === 新增：可学习的 Entropy Coefficient ===
-        # 初始值 0.01，范围 [0.001, 0.05]
-        self.ent_min = 0.001
-        self.ent_max = 0.05
-        self.ent_scale = self.ent_max - self.ent_min
-        init_ent_val = (ENTROPY_COEF - self.ent_min) / self.ent_scale
-        init_ent_logit = np.log(init_ent_val / (1.0 - init_ent_val))
-        self.ent_coef_logit = nn.Parameter(torch.tensor(float(init_ent_logit)))
+        # === 已删除 entropy_coef 相关参数 ===
 
     @property
     def gamma(self):
         return self.min_gamma + self.scale * torch.sigmoid(self.gamma_logit)
-    
-    @property
-    def entropy_coef(self):
-        return self.ent_min + self.ent_scale * torch.sigmoid(self.ent_coef_logit)
 
 # =====================================================
-#  Wrappers (同原版)
+#  Wrappers
 # =====================================================
 
 class FireResetWrapper(gym.Wrapper):
@@ -128,7 +113,7 @@ def make_atari_env(env_id, seed=None):
     return env
 
 # =====================================================
-#  改进点 4: 简化网络，加强正则化
+#  Model
 # =====================================================
 
 class ResidualBlock(nn.Module):
@@ -137,7 +122,6 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.relu = nn.ReLU(inplace=True)
-        # 添加 Dropout 防止过拟合
         self.dropout = nn.Dropout2d(0.1)
 
     def forward(self, x):
@@ -240,7 +224,7 @@ def vtrace_meta(behavior_logp, target_logp, rewards, values, dones, gamma_tensor
     return vs_t, pg_adv.detach()
 
 # =====================================================
-#  改进点 5: Actor 使用 Reward Scaling
+#  Actor
 # =====================================================
 
 @torch.no_grad()
@@ -296,12 +280,11 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
             done = term or trunc
             episode_return += r
             
-            # === 改进：使用 Scaling 而非 Clipping ===
-            r_scaled = r * REWARD_SCALE
-
+            r_scaled = np.sign(r) * np.log(1.0 + np.abs(r))
+            r_clip = float(r_scaled)
             actions.append(a)
             behavior_logps.append(logp)
-            rewards.append(r_scaled)
+            rewards.append(r_clip)
             dones.append(1.0 if done else 0.0)
 
             obs = next_obs
@@ -331,11 +314,14 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
             return
 
 # =====================================================
-#  改进点 6: 增强 Meta-Gradient 稳定性
+#  Learner (Updated: No Entropy Learning)
 # =====================================================
 
 def compute_loss_stateless(params, buffers, obs, actions, rewards, dones, logp_b, init_h, init_c, 
-                           gamma_tensor, ent_coef_tensor, agent_ref):
+                           gamma_tensor, agent_ref):
+    """
+    修改：去掉了 ent_coef_tensor 参数，改用全局 ENTROPY_COEF
+    """
     T, B = actions.shape
     T1 = obs.shape[0]
     
@@ -354,6 +340,7 @@ def compute_loss_stateless(params, buffers, obs, actions, rewards, dones, logp_b
     actions_expanded = actions.unsqueeze(-1)
     target_logp = torch.gather(log_probs_t, 2, actions_expanded).squeeze(-1)
     
+    # Meta-Learning 只针对 Gamma
     vs, pg_adv = vtrace_meta(logp_b, target_logp, rewards, values_t, dones, gamma_tensor)
     
     policy_loss = -(pg_adv * target_logp).mean()
@@ -362,8 +349,8 @@ def compute_loss_stateless(params, buffers, obs, actions, rewards, dones, logp_b
     probs_t = torch.exp(log_probs_t)
     entropy = -(probs_t * log_probs_t).sum(dim=-1).mean()
     
-    # === 使用可学习的 Entropy Coefficient ===
-    total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef_tensor * entropy
+    # 使用固定熵系数 ENTROPY_COEF
+    total_loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
     return total_loss, policy_loss, value_loss, entropy
 
 def meta_learner_train_step(agent, meta_params, optimizer, meta_optimizer, batch_list, update_count):
@@ -388,11 +375,12 @@ def meta_learner_train_step(agent, meta_params, optimizer, meta_optimizer, batch
     buffers = dict(agent.named_buffers())
     
     curr_gamma = meta_params.gamma
-    curr_ent = meta_params.entropy_coef
+    # === 修改：不再获取 curr_ent ===
     
     # === Phase 1: Inner Loop ===
+    # 传入的不再是 learned entropy，而是没有 ent 参数
     loss_A, pl_A, vl_A, ent_A = compute_loss_stateless(
-        params, buffers, *data_A, curr_gamma.detach(), curr_ent.detach(), agent
+        params, buffers, *data_A, curr_gamma.detach(), agent
     )
     
     grads = torch.autograd.grad(loss_A, params.values(), create_graph=True)
@@ -402,27 +390,28 @@ def meta_learner_train_step(agent, meta_params, optimizer, meta_optimizer, batch
     for (name, p), g in zip(params.items(), grads):
         params_prime[name] = p - lr_inner * g
 
-    # === Phase 2: Outer Loop (仅在 Warmup 后更新 Meta) ===
+    # === Phase 2: Outer Loop (Meta Update) ===
     if update_count >= WARMUP_UPDATES:
         loss_B, _, _, _ = compute_loss_stateless(
-            params_prime, buffers, *data_B, curr_gamma, curr_ent, agent
+            params_prime, buffers, *data_B, curr_gamma, agent
         )
         
         meta_optimizer.zero_grad()
         loss_B.backward()
-        torch.nn.utils.clip_grad_norm_(meta_params.parameters(), 0.1)  # 极严格裁剪
+        torch.nn.utils.clip_grad_norm_(meta_params.parameters(), 0.1)
         meta_optimizer.step()
     
     # === Phase 3: Actual Update ===
     optimizer.zero_grad()
     loss_A_final, _, _, _ = compute_loss_stateless(
-        params, buffers, *data_A, curr_gamma.detach(), curr_ent.detach(), agent
+        params, buffers, *data_A, curr_gamma.detach(), agent
     )
     loss_A_final.backward()
     torch.nn.utils.clip_grad_norm_(agent.parameters(), CLIP_GRAD_NORM)
     optimizer.step()
     
-    return loss_A.item(), pl_A.item(), vl_A.item(), ent_A.item(), curr_gamma.item(), curr_ent.item()
+    # 只返回 Gamma，不返回 ent_coef
+    return loss_A.item(), pl_A.item(), vl_A.item(), ent_A.item(), curr_gamma.item()
 
 # =====================================================
 #  Evaluation
@@ -461,9 +450,7 @@ def run(seed=42):
     env.close()
 
     print(f"[Meta-IMPALA v2] Env: {ENV_ID}")
-    print(f"[Meta-IMPALA v2] Obs: {obs.shape}, Acts: {action_dim}")
-    print(f"[Meta-IMPALA v2] Device: {DEVICE}, Actors: {NUM_ACTORS}")
-    print(f"[Meta-IMPALA v2] Reward Scale: {REWARD_SCALE}, Warmup: {WARMUP_UPDATES}")
+    print(f"[Meta-IMPALA v2] Gamma Only Meta-Learning")
 
     agent = ImpalaCNN_LSTM(obs.shape[0], action_dim).to(DEVICE)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
@@ -471,8 +458,8 @@ def run(seed=42):
     meta_params = MetaParams().to(DEVICE)
     meta_optimizer = torch.optim.Adam(meta_params.parameters(), lr=META_LR)
 
-    print(f"[Meta-IMPALA v2] Initial Gamma: {meta_params.gamma.item():.4f}")
-    print(f"[Meta-IMPALA v2] Initial Entropy Coef: {meta_params.entropy_coef.item():.4f}")
+    curr_g = meta_params.gamma.item()
+    print(f"[Meta-IMPALA v2] Initial Gamma: {curr_g:.4f}")
 
     data_queue = mp.Queue(maxsize=NUM_ACTORS * 2)
     param_queues = [mp.Queue(maxsize=1) for _ in range(NUM_ACTORS)]
@@ -496,8 +483,8 @@ def run(seed=42):
     
     records = []
     os.makedirs("checkpoints", exist_ok=True)
-    npy_path = f"checkpoints/meta_impala_v2_{ENV_ID.replace('/', '_')}_records.npy"
-    model_path = f"checkpoints/meta_impala_v2_{ENV_ID.replace('/', '_')}.pth"
+    npy_path = f"checkpoints/meta_impala_v2_gamma_only_{ENV_ID.replace('/', '_')}_records.npy"
+    model_path = f"checkpoints/meta_impala_v2_gamma_only_{ENV_ID.replace('/', '_')}.pth"
 
     best_score = -float('inf')
 
@@ -511,10 +498,12 @@ def run(seed=42):
 
                 if "real_returns" in batch and len(batch["real_returns"]) > 0:
                     for ret in batch["real_returns"]:
-                        records.append((total_frames, ret))
-                        print(f"Episode | Frames: {total_frames} | Return: {ret:.1f}")
+                        # === 修改：只记录 (Frame, Score, Gamma) ===
+                        records.append((total_frames, ret, curr_g))
+                        print(f"Episode | Frames: {total_frames} | Return: {ret:.1f} | G: {curr_g:.4f}")
 
-            loss, pl, vl, ent, curr_g, curr_ent = meta_learner_train_step(
+            # === 修改：meta_learner_train_step 只返回 Gamma ===
+            loss, pl, vl, ent_val, curr_g = meta_learner_train_step(
                 agent, meta_params, optimizer, meta_optimizer, batch_list, update_count
             )
             update_count += 1
@@ -532,7 +521,7 @@ def run(seed=42):
                 print(
                     f"[Update {update_count:5d}] Frames: {total_frames/1e6:.2f}M | "
                     f"Loss: {loss:.3f} | PL: {pl:.3f} | VL: {vl:.3f} | "
-                    f"Gamma: {curr_g:.4f} | Ent: {curr_ent:.4f} | FPS: {fps:.0f}"
+                    f"Gamma: {curr_g:.4f} | FPS: {fps:.0f}"
                 )
                 np.save(npy_path, np.array(records, dtype=np.float32))
 

@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # 1. 讀取數據 (請確保路徑正確)
-path = "/gemini/code/project/Meta_Gradient/checkpoints/meta_impala_ALE_Defender-v5_records.npy"
+path = "/gemini/code/project/baselinemodel/checkpoints/bs32_lstm_amidar_records.npy"
 try:
     data = np.load(path)
 except FileNotFoundError:
