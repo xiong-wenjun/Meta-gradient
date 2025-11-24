@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # 1. 讀取數據 (請確保路徑正確)
-path = "/gemini/code/project/baselinemodel/checkpoints/impala_lstm_ALE_Defender-v5_records.npy"
+path = "/gemini/code/project/Meta_Gradient/checkpoints/meta_impala_ALE_Defender-v5_records.npy"
 try:
     data = np.load(path)
 except FileNotFoundError:
@@ -28,7 +28,7 @@ plt.figure(figsize=(12, 6), dpi=100) # dpi=100 讓顯示更清晰
 plt.plot(df['frames'], df['smooth'], color='red', linewidth=2, label='Smoothed (Moving Avg)')
 
 # 設置標題和標籤
-plt.title("IMPALA (ResNet + LSTM) Training Curve - Defender", fontsize=14)
+plt.title("IMPALA (ResNet) Training Curve - Defender", fontsize=14)
 plt.xlabel("Frames", fontsize=12)
 plt.ylabel("Score", fontsize=12)
 plt.grid(True, alpha=0.3)

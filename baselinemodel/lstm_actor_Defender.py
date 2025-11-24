@@ -278,8 +278,10 @@ def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
             done = terminated or truncated
 
             episode_return += r
-            r_clip = float(np.clip(r, -1, 1))
-
+            #r_clip = float(np.clip(r, -1, 1))
+            r_scaled = np.sign(r) * np.log(1.0 + np.abs(r))
+            r_clip = float(r_scaled)
+            
             actions.append(a)
             behavior_logps.append(logp)
             rewards.append(r_clip)

@@ -1,13 +1,10 @@
 import os
-# 指定使用第二张显卡 (索引为 1)
-os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import time
 import random
 import queue
 import numpy as np
-from collections import OrderedDict
-
 import gymnasium as gym
 import ale_py
 
@@ -16,8 +13,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.distributions import Categorical
+import torch.func as tf
 
-# 注册 ALE 游戏
+# =====================================================
+#  改进点 1: 调整超参数
+# =====================================================
+
 gym.register_envs(ale_py)
 
 try:
@@ -25,81 +26,123 @@ try:
 except RuntimeError:
     pass
 
-# ---------------------------
-#  Global Hyperparameters (DeepMind Paper Config)
-# ---------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
-    # A100/3090/4090 开启 TF32 加速
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
 ENV_ID = "ALE/Defender-v5"
 
-# --- Paper Implementation Details ---
-# Actors & Rollout
-NUM_ACTORS = 80             # Paper: 80 (A100 可以轻松带起来)
-UNROLL_LENGTH = 20          # Paper: 20
+NUM_ACTORS = 80
+UNROLL_LENGTH = 80
+BATCH_UNROLLS = 32
+
+MAX_FRAMES = 200_000_000
+
+# === 关键改进：降低学习率，提高稳定性 ===
+LR = 2e-4           # 从 5e-4 降到 2e-4
+META_LR = 5e-5      # 从 1e-4 降到 5e-5，更保守
+WARMUP_UPDATES = 500  # 前500步只训练主网络，不更新Gamma
+
+ENTROPY_COEF = 0.01
+VALUE_COEF = 0.5
+CLIP_GRAD_NORM = 10.0  # 从40降到10，更严格的梯度裁剪
 FRAME_SKIP = 4
 
-# Inner Loop (Agent) Params
-INNER_BATCH_SIZE = 32       # Paper: 32
-LR_START = 0.0006           # Paper: 0.0006
-LR_END = 0.0                # Paper: Anneal to 0
-RMS_ALPHA = 0.99            # Paper: Decay 0.99
-RMS_MOMENTUM = 0.0          # Paper: Momentum 0.0
-RMS_EPS = 0.1               # Paper: Epsilon 0.1 (这是防梯度的关键！)
-CLIP_GRAD_NORM = 40.0       # Paper: 40.0
-ENTROPY_COEF = 0.01         # Paper: 0.01
-VALUE_COEF = 0.5            # Paper: 0.5
+# === 改进点 2: Reward Scaling 替代 Clipping ===
+REWARD_SCALE = 0.01  # 把分数缩小100倍，而不是clip
 
-# Meta Loop (Hyperparams) Params
-META_BATCH_SIZE = 8         # Paper: 8
-META_LR = 0.001             # Paper: 0.001 (Adam)
-EMBED_SIZE = 16             # Paper: Embedding size for eta = 16
+# =====================================================
+#  改进点 3: 放宽 Gamma 范围，增加 Entropy Bonus
+# =====================================================
 
-MAX_FRAMES = 50_000_000     # Total training frames
+class MetaParams(nn.Module):
+    def __init__(self, init_gamma=0.99):
+        super().__init__()
+        # 扩大范围到 [0.90, 0.999]，给Meta-Learner更多自由度
+        self.min_gamma = 0.90
+        self.max_gamma = 0.999
+        self.scale = self.max_gamma - self.min_gamma
+        
+        init_val = (init_gamma - self.min_gamma) / self.scale
+        init_logit = np.log(init_val / (1.0 - init_val))
+        
+        self.gamma_logit = nn.Parameter(torch.tensor(float(init_logit)))
+        
+        # === 新增：可学习的 Entropy Coefficient ===
+        # 初始值 0.01，范围 [0.001, 0.05]
+        self.ent_min = 0.001
+        self.ent_max = 0.05
+        self.ent_scale = self.ent_max - self.ent_min
+        init_ent_val = (ENTROPY_COEF - self.ent_min) / self.ent_scale
+        init_ent_logit = np.log(init_ent_val / (1.0 - init_ent_val))
+        self.ent_coef_logit = nn.Parameter(torch.tensor(float(init_ent_logit)))
 
-# ---------------------------
-#  Wrappers
-# ---------------------------
+    @property
+    def gamma(self):
+        return self.min_gamma + self.scale * torch.sigmoid(self.gamma_logit)
+    
+    @property
+    def entropy_coef(self):
+        return self.ent_min + self.ent_scale * torch.sigmoid(self.ent_coef_logit)
+
+# =====================================================
+#  Wrappers (同原版)
+# =====================================================
+
 class FireResetWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
+        self.has_fire = False 
         if len(env.unwrapped.get_action_meanings()) >= 3:
-             assert env.unwrapped.get_action_meanings()[1] == 'FIRE'
+             if env.unwrapped.get_action_meanings()[1] == 'FIRE':
+                 self.has_fire = True
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        obs, _, term, trunc, _ = self.env.step(1)
-        if term or trunc: self.env.reset(**kwargs)
-        obs, _, term, trunc, _ = self.env.step(0)
-        if term or trunc: self.env.reset(**kwargs)
+        if not self.has_fire:
+            return obs, info
+        obs, _, terminated, truncated, _ = self.env.step(1)
+        if terminated or truncated:
+            obs, info = self.env.reset(**kwargs)
+        obs, _, terminated, truncated, _ = self.env.step(0)
+        if terminated or truncated:
+            obs, info = self.env.reset(**kwargs)
         return obs, info
 
 def make_atari_env(env_id, seed=None):
     env = gym.make(env_id, frameskip=1)
     env = gym.wrappers.AtariPreprocessing(
-        env, screen_size=84, grayscale_obs=True, scale_obs=False, 
-        frame_skip=FRAME_SKIP, noop_max=30
+        env,
+        screen_size=84,
+        grayscale_obs=True,
+        scale_obs=False,
+        frame_skip=FRAME_SKIP,
+        noop_max=30,
     )
     env = FireResetWrapper(env)
     env = gym.wrappers.FrameStackObservation(env, stack_size=4)
-    if seed is not None: env.reset(seed=seed)
+    if seed is not None:
+        env.reset(seed=seed)
     return env
 
-# ---------------------------
-#  Network with Embedding Head (Paper Config)
-# ---------------------------
+# =====================================================
+#  改进点 4: 简化网络，加强正则化
+# =====================================================
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.relu = nn.ReLU(inplace=True)
+        # 添加 Dropout 防止过拟合
+        self.dropout = nn.Dropout2d(0.1)
+
     def forward(self, x):
         out = self.relu(self.conv1(x))
+        out = self.dropout(out)
         out = self.conv2(out)
         return self.relu(out + x)
 
@@ -111,6 +154,7 @@ class ImpalaBlock(nn.Module):
         self.res1 = ResidualBlock(out_channels)
         self.res2 = ResidualBlock(out_channels)
         self.relu = nn.ReLU(inplace=True)
+
     def forward(self, x):
         x = self.relu(self.conv(x))
         x = self.pool(x)
@@ -118,353 +162,397 @@ class ImpalaBlock(nn.Module):
         x = self.res2(x)
         return x
 
-class MetaImpalaCNN(nn.Module):
-    def __init__(self, input_channels, action_dim):
+class ImpalaCNN_LSTM(nn.Module):
+    def __init__(self, input_channels, action_dim, hidden_size=256):
         super().__init__()
-        # Deep ResNet
         self.block1 = ImpalaBlock(input_channels, 16)
         self.block2 = ImpalaBlock(16, 32)
         self.block3 = ImpalaBlock(32, 32)
-        
-        self.fc = nn.Linear(32 * 11 * 11, 256)
+
+        self.fc = nn.Linear(32 * 11 * 11, hidden_size)
         self.relu = nn.ReLU(inplace=True)
+
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTMCell(input_size=hidden_size, hidden_size=hidden_size)
+
+        self.policy = nn.Linear(hidden_size, action_dim)
+        self.value = nn.Linear(hidden_size, 1)
+
+    def get_initial_state(self, batch_size, device):
+        h0 = torch.zeros(batch_size, self.hidden_size, device=device)
+        c0 = torch.zeros(batch_size, self.hidden_size, device=device)
+        return (h0, c0)
+
+    def forward(self, x, core_state):
+        T, B, C, H, W = x.shape
         
-        # Policy & Value
-        self.policy = nn.Linear(256, action_dim)
-        self.value = nn.Linear(256, 1)
-        
-        # === Meta Heads with Embedding (Paper Config) ===
-        self.gamma_embed = nn.Linear(256, EMBED_SIZE)
-        self.gamma_out = nn.Linear(EMBED_SIZE, 1)
-        
-        self.lambda_embed = nn.Linear(256, EMBED_SIZE)
-        self.lambda_out = nn.Linear(EMBED_SIZE, 1)
-        # 1. 初始化 Bias 为 +5.0
-        #    这样 Sigmoid(5.0) ≈ 0.993
-        #    让 Gamma 和 Lambda 从一开始就处于“高位”
-        nn.init.constant_(self.gamma_out.bias, 5.0)
-        nn.init.constant_(self.lambda_out.bias, 5.0)
-        
-        # 2. (可选) 初始化 Weight 为极小值
-        #    这样一开始 feature 对 gamma 的影响很小，主要由 bias 决定
-        nn.init.orthogonal_(self.gamma_out.weight, gain=0.01)
-        nn.init.orthogonal_(self.lambda_out.weight, gain=0.01)
-    def forward(self, x):
+        x = x.contiguous().view(T * B, C, H, W)
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
-        x = x.reshape(x.size(0), -1)
-        feat = self.relu(self.fc(x))
+        x = x.view(x.size(0), -1)
+        feat = self.relu(self.fc(x)) 
         
-        logits = self.policy(feat)
-        value = self.value(feat).squeeze(-1)
+        feat = feat.view(T, B, -1)
+
+        h, c = core_state
         
-        # Meta Gamma (Constrained Range)
-        g_emb = self.relu(self.gamma_embed(feat))
-        raw_gamma = torch.sigmoid(self.gamma_out(g_emb)).squeeze(-1)
-        gamma = raw_gamma * 0.05+ 0.95  # [0.95, 0.999]
-
-        # Meta Lambda (Constrained Range)
-        l_emb = self.relu(self.lambda_embed(feat))
-        raw_lambda = torch.sigmoid(self.lambda_out(l_emb)).squeeze(-1)
-        lamb = raw_lambda * 0.1 + 0.9     # [0.9, 1.0]
+        outputs = []
+        for t in range(T):
+            h, c = self.lstm(feat[t], (h, c))
+            outputs.append(h)
+            
+        lstm_out = torch.stack(outputs, dim=0)
         
-        return logits, value, gamma, lamb
+        out_flat = lstm_out.view(T * B, -1)
+        logits = self.policy(out_flat)
+        values = self.value(out_flat).squeeze(-1)
 
-# ---------------------------
-#  Functional Forward (For Meta-Update Validation)
-# ---------------------------
-def functional_forward(model, params, x):
-    def conv2d(inp, w, b, stride=1, padding=0): return F.conv2d(inp, w, b, stride=stride, padding=padding)
-    def linear(inp, w, b): return F.linear(inp, w, b)
-    def block(inp, pre, in_c, out_c):
-        x = F.relu(conv2d(inp, params[f'{pre}.conv.weight'], params[f'{pre}.conv.bias'], padding=1))
-        x = F.max_pool2d(x, 3, stride=2, padding=1)
-        r = F.relu(conv2d(x, params[f'{pre}.res1.conv1.weight'], params[f'{pre}.res1.conv1.bias'], padding=1))
-        r = conv2d(r, params[f'{pre}.res1.conv2.weight'], params[f'{pre}.res1.conv2.bias'], padding=1)
-        x = F.relu(x + r)
-        r = F.relu(conv2d(x, params[f'{pre}.res2.conv1.weight'], params[f'{pre}.res2.conv1.bias'], padding=1))
-        r = conv2d(r, params[f'{pre}.res2.conv2.weight'], params[f'{pre}.res2.conv2.bias'], padding=1)
-        x = F.relu(x + r)
-        return x
+        return logits, values, (h, c)
 
-    x = block(x, 'block1', 4, 16)
-    x = block(x, 'block2', 16, 32)
-    x = block(x, 'block3', 32, 32)
-    x = x.reshape(x.size(0), -1)
-    feat = F.relu(linear(x, params['fc.weight'], params['fc.bias']))
-    logits = linear(feat, params['policy.weight'], params['policy.bias'])
-    value = linear(feat, params['value.weight'], params['value.bias']).squeeze(-1)
-    return logits, value
+# =====================================================
+#  V-trace
+# =====================================================
 
-# ---------------------------
-#  Meta V-Trace
-# ---------------------------
-def meta_vtrace(logp_b, logp_t, rew, val, done, gammas, lambdas, rho_bar=1.0, c_bar=1.0):
-    log_rhos = logp_t - logp_b
+def vtrace_meta(behavior_logp, target_logp, rewards, values, dones, gamma_tensor, rho_bar=1.0, c_bar=1.0):
+    T, B = rewards.shape
+
+    log_rhos = target_logp - behavior_logp
     rhos = torch.exp(log_rhos)
     rhos_clipped = torch.clamp(rhos, max=rho_bar)
     cs = torch.clamp(rhos, max=c_bar)
-    
-    T, B = rew.shape
-    vs = torch.zeros_like(val)
-    vs[-1] = val[-1]
-    
-    for t in reversed(range(T)):
-        g_t = gammas[t] * (1.0 - done[t])
-        l_t = lambdas[t]
-        delta = rhos_clipped[t] * (rew[t] + g_t * val[t + 1] - val[t])
-        vs[t] = val[t] + delta + g_t * l_t * cs[t] * (vs[t + 1] - val[t + 1])
-        
-    pg_adv = rhos_clipped * (rew + gammas[:-1] * (1.0 - done) * vs[1:] - val[:-1])
-    return vs[:-1], pg_adv
 
-# ---------------------------
-#  Helpers
-# ---------------------------
+    discounts = gamma_tensor * (1.0 - dones)
+    values_detached = values.detach()
+
+    vs = torch.zeros_like(values_detached)
+    vs[-1] = values_detached[-1]
+
+    for t in reversed(range(T)):
+        delta = rhos_clipped[t] * (rewards[t] + discounts[t] * values_detached[t+1] - values_detached[t])
+        vs[t] = values_detached[t] + delta + discounts[t] * cs[t] * (vs[t+1] - values_detached[t+1])
+
+    vs_t = vs[:-1]
+    vs_tp1 = vs[1:]
+
+    pg_adv = rhos_clipped * (rewards + discounts * vs_tp1 - values_detached[:-1])
+    
+    return vs_t, pg_adv.detach()
+
+# =====================================================
+#  改进点 5: Actor 使用 Reward Scaling
+# =====================================================
+
 @torch.no_grad()
-def select_action(agent, obs, device):
+def select_action(agent, obs, core_state, device):
     obs = np.array(obs, copy=False)
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device) / 255.0
-    if obs_t.ndim == 3: obs_t = obs_t.unsqueeze(0)
-    logits, _, _, _ = agent(obs_t)
+    if obs_t.ndim == 3:
+        obs_t = obs_t.unsqueeze(0).unsqueeze(0)
+
+    logits_flat, _, new_core = agent(obs_t, core_state)
+    logits = logits_flat.view(1, -1)
     dist = Categorical(logits=logits)
     action = dist.sample()
     logp = dist.log_prob(action)
-    return int(action.item()), float(logp.item())
-
-def prepare_batch(batch_list, device):
-    obs = torch.tensor(np.stack([b["obs"] for b in batch_list], axis=1), dtype=torch.float32, device=device) / 255.0
-    actions = torch.tensor(np.stack([b["actions"] for b in batch_list], axis=1), dtype=torch.long, device=device)
-    rewards = torch.tensor(np.stack([b["rewards"] for b in batch_list], axis=1), dtype=torch.float32, device=device)
-    dones = torch.tensor(np.stack([b["dones"] for b in batch_list], axis=1), dtype=torch.float32, device=device)
-    logp_b = torch.tensor(np.stack([b["logp_b"] for b in batch_list], axis=1), dtype=torch.float32, device=device)
-    return obs, actions, rewards, dones, logp_b
+    return int(action.item()), float(logp.item()), new_core
 
 def actor_process(rank, env_id, unroll_length, data_queue, param_queue, seed):
     torch.set_num_threads(1)
     device = torch.device("cpu")
     env = make_atari_env(env_id, seed=seed)
     obs, _ = env.reset()
-    agent = MetaImpalaCNN(obs.shape[0], env.action_space.n).to(device)
-    
-    try: weights = param_queue.get(timeout=10.0)
-    except queue.Empty: return
-    agent.load_state_dict(weights)
+    action_dim = env.action_space.n
+
+    agent = ImpalaCNN_LSTM(obs.shape[0], action_dim).to(device)
+    core_state = agent.get_initial_state(batch_size=1, device=device)
+
+    try:
+        weights = param_queue.get(timeout=60.0)
+        agent.load_state_dict(weights)
+    except queue.Empty:
+        return
+
+    episode_return = 0.0
 
     while True:
-        try: 
-            while True: weights = param_queue.get_nowait()
-        except queue.Empty: pass
+        try:
+            while True:
+                weights = param_queue.get_nowait()
+        except queue.Empty:
+            pass
         agent.load_state_dict(weights)
+
+        obs_list, actions, rewards, dones, behavior_logps = [], [], [], [], []
+        real_ret = [] 
         
-        obs_l, act_l, rew_l, don_l, log_l = [], [], [], [], []
-        for _ in range(unroll_length):
-            obs_l.append(np.array(obs, dtype=np.uint8))
-            a, logp = select_action(agent, obs, device)
-            obs_next, r, term, trunc, _ = env.step(a)
+        init_h = core_state[0].cpu().numpy()
+        init_c = core_state[1].cpu().numpy()
+
+        for t in range(unroll_length):
+            obs_list.append(np.array(obs, dtype=np.uint8))
+            a, logp, core_state = select_action(agent, obs, core_state, device)
+            next_obs, r, term, trunc, _ = env.step(a)
             done = term or trunc
-            act_l.append(a); log_l.append(logp); rew_l.append(np.clip(r, -1, 1)); don_l.append(1.0 if done else 0.0)
-            obs = obs_next
-            if done: obs, _ = env.reset()
-        obs_l.append(np.array(obs, dtype=np.uint8))
-        
-        data_queue.put({
-            "obs": np.stack(obs_l, axis=0), "actions": np.array(act_l), 
-            "rewards": np.array(rew_l), "dones": np.array(don_l), "logp_b": np.array(log_l)
-        })
-
-# ---------------------------
-#  Meta-Training Step
-# ---------------------------
-def meta_train_step(agent, optimizer_inner, optimizer_meta, batch_train, batch_valid, current_lr):
-    # 1. Prepare Data
-    obs_t, act_t, rew_t, done_t, logp_b_t = prepare_batch(batch_train, DEVICE)
-    obs_v, act_v, rew_v, done_v, logp_b_v = prepare_batch(batch_valid, DEVICE)
-    
-    # === Inner Loop ===
-    T1, B1, C, H, W = obs_t.shape
-    logits_flat, values_flat, gammas_flat, lambdas_flat = agent(obs_t.view(T1*B1, C, H, W))
-    
-    logits = logits_flat.view(T1, B1, -1)
-    values = values_flat.view(T1, B1)
-    gammas = gammas_flat.view(T1, B1)
-    lambdas = lambdas_flat.view(T1, B1)
-    
-    log_probs = F.log_softmax(logits[:-1], dim=-1)
-    logp = torch.gather(log_probs, 2, act_t.unsqueeze(-1)).squeeze(-1)
-    
-    # Calculate Targets WITHOUT detach on gammas/lambdas
-    vs, pg_adv = meta_vtrace(logp_b_t, logp, rew_t, values, done_t, gammas, lambdas)
-    
-    # Loss (Allowing gradient flow through Value Loss)
-    value_loss = F.mse_loss(values[:-1], vs)
-    policy_loss = -(pg_adv.detach() * logp).mean()
-    entropy = -(torch.exp(log_probs) * log_probs).sum(-1).mean()
-    
-    inner_loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
-
-    # Circuit Breaker 1 (Loss Explosion)
-    if inner_loss.item() > 200 or torch.isnan(inner_loss):
-        print(f"[WARN] Inner Loss Explosion: {inner_loss.item()}. Skip.")
-        optimizer_inner.zero_grad(); optimizer_meta.zero_grad()
-        return inner_loss.item(), 0, 0
-
-    # Gradients for Inner Update
-    grads = torch.autograd.grad(inner_loss, agent.parameters(), create_graph=True, allow_unused=True)
-    
-    # Manual SGD Step for Meta-Validation
-    fast_weights = OrderedDict()
-    for (name, param), grad in zip(agent.named_parameters(), grads):
-        if grad is None or "gamma" in name or "lambda" in name:
-            fast_weights[name] = param
-        else:
-            fast_weights[name] = param - current_lr * grad
-
-    # === Outer Loop (Meta Update) ===
-    T_v, B_v = act_v.shape
-    logits_val, _ = functional_forward(agent, fast_weights, obs_v.view((T_v+1)*B_v, C, H, W))
-    
-    logits_val = logits_val.view(T_v+1, B_v, -1)
-    log_probs_val = F.log_softmax(logits_val[:-1], dim=-1)
-    logp_val = torch.gather(log_probs_val, 2, act_v.unsqueeze(-1)).squeeze(-1)
-    
-    # Fixed Gamma anchor for validation
-    with torch.no_grad():
-        _, val_values_fixed = functional_forward(agent, fast_weights, obs_v.view((T_v+1)*B_v, C, H, W))
-        val_values_fixed = val_values_fixed.view(T_v+1, B_v)
-        rets, R = torch.zeros_like(rew_v), val_values_fixed[-1]
-        for t in reversed(range(T_v)):
-            R = rew_v[t] + 0.99 * (1 - done_v[t]) * R
-            rets[t] = R
-        adv_val = rets - val_values_fixed[:-1]
-        
-    meta_loss = -(adv_val * logp_val).mean()
-
-    # Apply Meta Gradients
-    optimizer_meta.zero_grad()
-    meta_grads = torch.autograd.grad(meta_loss, agent.parameters(), allow_unused=True)
-    
-    for (name, param), g_meta in zip(agent.named_parameters(), meta_grads):
-        if g_meta is not None and ("gamma" in name or "lambda" in name):
-            if param.grad is None: param.grad = torch.zeros_like(param)
-            param.grad.add_(g_meta)
+            episode_return += r
             
-    # Circuit Breaker 2 (Gradient Explosion)
-    grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), CLIP_GRAD_NORM)
-    if torch.isnan(grad_norm) or grad_norm > 1000:
-        print("[WARN] Meta Gradient Explosion. Skip.")
-        optimizer_inner.zero_grad(); optimizer_meta.zero_grad()
-        return inner_loss.item(), gammas.mean().item(), lambdas.mean().item()
-        
-    optimizer_meta.step()
+            # === 改进：使用 Scaling 而非 Clipping ===
+            r_scaled = r * REWARD_SCALE
 
-    # Apply Inner Gradients (RMSProp)
-    optimizer_inner.zero_grad()
-    for param, g_inner in zip(agent.parameters(), grads):
-        if g_inner is not None:
-            if param.grad is None: param.grad = torch.zeros_like(param)
-            param.grad.add_(g_inner.detach())
+            actions.append(a)
+            behavior_logps.append(logp)
+            rewards.append(r_scaled)
+            dones.append(1.0 if done else 0.0)
+
+            obs = next_obs
             
+            if done:
+                real_ret.append(episode_return)
+                episode_return = 0.0
+                obs, _ = env.reset()
+                core_state = agent.get_initial_state(1, device)
+
+        obs_list.append(np.array(obs, dtype=np.uint8))
+
+        batch = {
+            "obs": np.stack(obs_list, axis=0),
+            "actions": np.array(actions, dtype=np.int64),
+            "rewards": np.array(rewards, dtype=np.float32),
+            "dones": np.array(dones, dtype=np.float32),
+            "logp_b": np.array(behavior_logps, dtype=np.float32),
+            "init_h": init_h,
+            "init_c": init_c,
+            "real_returns": np.array(real_ret, dtype=np.float32),
+        }
+        
+        try:
+            data_queue.put(batch)
+        except:
+            return
+
+# =====================================================
+#  改进点 6: 增强 Meta-Gradient 稳定性
+# =====================================================
+
+def compute_loss_stateless(params, buffers, obs, actions, rewards, dones, logp_b, init_h, init_c, 
+                           gamma_tensor, ent_coef_tensor, agent_ref):
+    T, B = actions.shape
+    T1 = obs.shape[0]
+    
+    core_state = (init_h, init_c)
+    
+    logits_flat, values_flat, _ = tf.functional_call(agent_ref, (params, buffers), (obs, core_state))
+    
+    action_dim = logits_flat.shape[-1]
+    logits = logits_flat.view(T1, B, action_dim)
+    values = values_flat.view(T1, B)
+    
+    logits_t = logits[:-1]
+    values_t = values
+    log_probs_t = F.log_softmax(logits_t, dim=-1)
+    
+    actions_expanded = actions.unsqueeze(-1)
+    target_logp = torch.gather(log_probs_t, 2, actions_expanded).squeeze(-1)
+    
+    vs, pg_adv = vtrace_meta(logp_b, target_logp, rewards, values_t, dones, gamma_tensor)
+    
+    policy_loss = -(pg_adv * target_logp).mean()
+    value_loss = F.mse_loss(values_t[:-1], vs)
+    
+    probs_t = torch.exp(log_probs_t)
+    entropy = -(probs_t * log_probs_t).sum(dim=-1).mean()
+    
+    # === 使用可学习的 Entropy Coefficient ===
+    total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef_tensor * entropy
+    return total_loss, policy_loss, value_loss, entropy
+
+def meta_learner_train_step(agent, meta_params, optimizer, meta_optimizer, batch_list, update_count):
+    mid = len(batch_list) // 2
+    batch_A = batch_list[:mid]
+    batch_B = batch_list[mid:]
+    
+    def prepare_data(b_lst):
+        obs = torch.tensor(np.stack([b["obs"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE) / 255.0
+        act = torch.tensor(np.stack([b["actions"] for b in b_lst], axis=1), dtype=torch.long, device=DEVICE)
+        rew = torch.tensor(np.stack([b["rewards"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE)
+        don = torch.tensor(np.stack([b["dones"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE)
+        log = torch.tensor(np.stack([b["logp_b"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE)
+        ih = torch.tensor(np.stack([b["init_h"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE).squeeze(0)
+        ic = torch.tensor(np.stack([b["init_c"] for b in b_lst], axis=1), dtype=torch.float32, device=DEVICE).squeeze(0)
+        return obs, act, rew, don, log, ih, ic
+
+    data_A = prepare_data(batch_A)
+    data_B = prepare_data(batch_B)
+    
+    params = dict(agent.named_parameters())
+    buffers = dict(agent.named_buffers())
+    
+    curr_gamma = meta_params.gamma
+    curr_ent = meta_params.entropy_coef
+    
+    # === Phase 1: Inner Loop ===
+    loss_A, pl_A, vl_A, ent_A = compute_loss_stateless(
+        params, buffers, *data_A, curr_gamma.detach(), curr_ent.detach(), agent
+    )
+    
+    grads = torch.autograd.grad(loss_A, params.values(), create_graph=True)
+    
+    lr_inner = optimizer.param_groups[0]['lr']
+    params_prime = {}
+    for (name, p), g in zip(params.items(), grads):
+        params_prime[name] = p - lr_inner * g
+
+    # === Phase 2: Outer Loop (仅在 Warmup 后更新 Meta) ===
+    if update_count >= WARMUP_UPDATES:
+        loss_B, _, _, _ = compute_loss_stateless(
+            params_prime, buffers, *data_B, curr_gamma, curr_ent, agent
+        )
+        
+        meta_optimizer.zero_grad()
+        loss_B.backward()
+        torch.nn.utils.clip_grad_norm_(meta_params.parameters(), 0.1)  # 极严格裁剪
+        meta_optimizer.step()
+    
+    # === Phase 3: Actual Update ===
+    optimizer.zero_grad()
+    loss_A_final, _, _, _ = compute_loss_stateless(
+        params, buffers, *data_A, curr_gamma.detach(), curr_ent.detach(), agent
+    )
+    loss_A_final.backward()
     torch.nn.utils.clip_grad_norm_(agent.parameters(), CLIP_GRAD_NORM)
-    optimizer_inner.step()
+    optimizer.step()
     
-    return inner_loss.item(), gammas.mean().item(), lambdas.mean().item()
+    return loss_A.item(), pl_A.item(), vl_A.item(), ent_A.item(), curr_gamma.item(), curr_ent.item()
+
+# =====================================================
+#  Evaluation
+# =====================================================
 
 @torch.no_grad()
-def evaluate(env_id, agent, episodes=3):
-    env = make_atari_env(env_id); scores = []
+def evaluate(env_id, agent, episodes=5):
+    env = make_atari_env(env_id)
+    scores = []
     for _ in range(episodes):
-        obs, _ = env.reset(); done, tr = False, 0.0
+        obs, _ = env.reset()
+        done = False
+        total_r = 0.0
+        core_state = agent.get_initial_state(1, DEVICE)
         while not done:
-            t_obs = torch.tensor(np.array(obs), dtype=torch.float32, device=DEVICE).unsqueeze(0)/255.0
-            logits, _, _, _ = agent(t_obs)
-            a = torch.argmax(logits, -1).item()
-            obs, r, term, trunc, _ = env.step(a); done = term or trunc; tr += r
-        scores.append(tr)
-    return np.mean(scores)
+            a, _, core_state = select_action(agent, obs, core_state, DEVICE)
+            obs, r, term, trunc, _ = env.step(a)
+            done = term or trunc
+            total_r += r
+        scores.append(total_r)
+    env.close()
+    return float(np.mean(scores)), float(np.std(scores))
 
-# ---------------------------
+# =====================================================
 #  Main
-# ---------------------------
+# =====================================================
+
 def run(seed=42):
-    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
     env = make_atari_env(ENV_ID, seed=seed)
-    agent = MetaImpalaCNN(env.observation_space.shape[0], env.action_space.n).to(DEVICE)
-    
-    # === Optimizer Config from Paper ===
-    # Inner: RMSProp (eps=0.1)
-    optimizer_inner = torch.optim.RMSprop(
-        agent.parameters(), lr=LR_START, alpha=RMS_ALPHA, eps=RMS_EPS, momentum=RMS_MOMENTUM
-    )
-    # Outer: Adam
-    optimizer_meta = torch.optim.Adam(agent.parameters(), lr=META_LR)
-    
-    # Linear LR Scheduler
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer_inner, start_factor=1.0, end_factor=0.001, total_iters=MAX_FRAMES // (INNER_BATCH_SIZE * UNROLL_LENGTH)
-    )
+    obs, _ = env.reset()
+    action_dim = env.action_space.n
+    env.close()
 
-    data_queue = mp.Queue(maxsize=NUM_ACTORS*2)
+    print(f"[Meta-IMPALA v2] Env: {ENV_ID}")
+    print(f"[Meta-IMPALA v2] Obs: {obs.shape}, Acts: {action_dim}")
+    print(f"[Meta-IMPALA v2] Device: {DEVICE}, Actors: {NUM_ACTORS}")
+    print(f"[Meta-IMPALA v2] Reward Scale: {REWARD_SCALE}, Warmup: {WARMUP_UPDATES}")
+
+    agent = ImpalaCNN_LSTM(obs.shape[0], action_dim).to(DEVICE)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
+
+    meta_params = MetaParams().to(DEVICE)
+    meta_optimizer = torch.optim.Adam(meta_params.parameters(), lr=META_LR)
+
+    print(f"[Meta-IMPALA v2] Initial Gamma: {meta_params.gamma.item():.4f}")
+    print(f"[Meta-IMPALA v2] Initial Entropy Coef: {meta_params.entropy_coef.item():.4f}")
+
+    data_queue = mp.Queue(maxsize=NUM_ACTORS * 2)
     param_queues = [mp.Queue(maxsize=1) for _ in range(NUM_ACTORS)]
-    init_w = {k: v.cpu() for k,v in agent.state_dict().items()}
-    
-    print("Starting Actors...")
-    procs = []
-    for r in range(NUM_ACTORS):
-        param_queues[r].put(init_w)
-        p = mp.Process(target=actor_process, args=(r, ENV_ID, UNROLL_LENGTH, data_queue, param_queues[r], seed+r))
-        p.daemon=True; p.start(); procs.append(p)
 
-    total_frames = 0; upd = 0; start = time.time(); records = []
+    processes = []
+    init_state = {k: v.cpu() for k, v in agent.state_dict().items()}
     
-    # ====== 创建保存目录 ======
+    for rank in range(NUM_ACTORS):
+        param_queues[rank].put(init_state)
+        p = mp.Process(
+            target=actor_process,
+            args=(rank, ENV_ID, UNROLL_LENGTH, data_queue, param_queues[rank], seed + 1000 + rank),
+        )
+        p.daemon = True
+        p.start()
+        processes.append(p)
+
+    total_frames = 0
+    update_count = 0
+    start_time = time.time()
+    
+    records = []
     os.makedirs("checkpoints", exist_ok=True)
-    npy_path = f"checkpoints/meta_defender_recs.npy"
-    
+    npy_path = f"checkpoints/meta_impala_v2_{ENV_ID.replace('/', '_')}_records.npy"
+    model_path = f"checkpoints/meta_impala_v2_{ENV_ID.replace('/', '_')}.pth"
+
+    best_score = -float('inf')
+
     try:
         while total_frames < MAX_FRAMES:
-            # Paper: Batch Size 32 (Inner) + 8 (Meta)
-            batch_data = []
-            for _ in range(INNER_BATCH_SIZE + META_BATCH_SIZE):
-                batch_data.append(data_queue.get())
+            batch_list = []
+            for _ in range(BATCH_UNROLLS):
+                batch = data_queue.get()
+                batch_list.append(batch)
                 total_frames += UNROLL_LENGTH * FRAME_SKIP
-            
-            b_train = batch_data[:INNER_BATCH_SIZE]
-            b_valid = batch_data[INNER_BATCH_SIZE:]
-            
-            curr_lr = scheduler.get_last_lr()[0]
-            loss, g, l = meta_train_step(agent, optimizer_inner, optimizer_meta, b_train, b_valid, curr_lr)
-            
-            scheduler.step()
-            upd += 1
-            
-            if upd % 10 == 0:
-                cpu_w = {k: v.cpu() for k,v in agent.state_dict().items()}
-                for q in param_queues:
-                    try: 
-                        while not q.empty(): q.get_nowait()
-                    except: pass
-                    q.put(cpu_w)
-            
-            if upd % 100 == 0:
-                fps = total_frames / (time.time() - start)
-                print(f"[Upd {upd:5d}] F: {total_frames/1e6:.2f}M | L: {loss:.3f} | G: {g:.3f} L: {l:.3f} | LR: {curr_lr:.6f} | FPS: {fps:.0f}")
-                
-            if upd % 500 == 0:
-                sc = evaluate(ENV_ID, agent)
-                records.append((total_frames, sc))
-                print(f"=== Eval: {sc:.2f} ===")
-                # ====== 关键点：每次评估完保存 .npy ======
-                np.save(npy_path, np.array(records))
-                print(f"Data saved to {npy_path}")
 
-    except KeyboardInterrupt: print("Stop.")
+                if "real_returns" in batch and len(batch["real_returns"]) > 0:
+                    for ret in batch["real_returns"]:
+                        records.append((total_frames, ret))
+                        print(f"Episode | Frames: {total_frames} | Return: {ret:.1f}")
+
+            loss, pl, vl, ent, curr_g, curr_ent = meta_learner_train_step(
+                agent, meta_params, optimizer, meta_optimizer, batch_list, update_count
+            )
+            update_count += 1
+
+            if update_count % 5 == 0:
+                cpu_state = {k: v.cpu() for k, v in agent.state_dict().items()}
+                for q in param_queues:
+                    try:
+                        while not q.empty(): q.get_nowait()
+                    except queue.Empty: pass
+                    q.put(cpu_state)
+
+            if update_count % 100 == 0:
+                fps = total_frames / (time.time() - start_time)
+                print(
+                    f"[Update {update_count:5d}] Frames: {total_frames/1e6:.2f}M | "
+                    f"Loss: {loss:.3f} | PL: {pl:.3f} | VL: {vl:.3f} | "
+                    f"Gamma: {curr_g:.4f} | Ent: {curr_ent:.4f} | FPS: {fps:.0f}"
+                )
+                np.save(npy_path, np.array(records, dtype=np.float32))
+
+            if update_count % 500 == 0:
+                mean_sc, std_sc = evaluate(ENV_ID, agent, episodes=5)
+                print(f"=== Eval @ {total_frames/1e6:.2f}M | Score: {mean_sc:.1f} ± {std_sc:.1f} ===")
+                
+                if mean_sc > best_score:
+                    best_score = mean_sc
+                    torch.save(agent.state_dict(), model_path.replace('.pth', '_best.pth'))
+                    print(f">>> New Best: {best_score:.1f}")
+
+    except KeyboardInterrupt:
+        print("Interrupted!")
     finally:
-        for p in procs: p.terminate()
-        torch.save(agent.state_dict(), f"checkpoints/meta_defender_final.pth")
-        # ====== 关键点：结束时也保存 .npy ======
-        np.save(npy_path, np.array(records))
+        for p in processes:
+            p.terminate()
+        torch.save(agent.state_dict(), model_path)
+        np.save(npy_path, np.array(records, dtype=np.float32))
+        print(f"Saved to {model_path}")
 
 if __name__ == "__main__":
     run()
